@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 const vaultExt = ".vault"
@@ -69,13 +72,23 @@ func newVaultDir() string {
 	return dirs[len(dirs)-1]
 }
 
-// discoverVaults lists *.vault files in dirs.
-func discoverVaults(dirs []string) []vaultInfo {
+// discoverVaults lists *.vault files in dirs. A permission error on the
+// directory where new vaults go (the last entry) is reported, because on
+// macOS it usually means the user declined access to the removable volume.
+func discoverVaults(dirs []string) ([]vaultInfo, error) {
 	seen := map[string]bool{}
 	var out []vaultInfo
-	for _, d := range dirs {
+	for i, d := range dirs {
 		entries, err := os.ReadDir(d)
+		for retry := 0; err != nil && errors.Is(err, fs.ErrPermission) && retry < 3; retry++ {
+			// macOS may still be showing its "allow access to removable volume" prompt.
+			time.Sleep(time.Second)
+			entries, err = os.ReadDir(d)
+		}
 		if err != nil {
+			if i == len(dirs)-1 && errors.Is(err, fs.ErrPermission) {
+				return nil, fmt.Errorf("VaultLock is not allowed to read %s.\n\nOn macOS, open System Settings → Privacy & Security → Files and Folders, find VaultLock and allow \"Removable Volumes\", then start VaultLock again.", d)
+			}
 			continue
 		}
 		for _, e := range entries {
@@ -101,7 +114,7 @@ func discoverVaults(dirs []string) []vaultInfo {
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return out
+	return out, nil
 }
 
 // allowedActions implements the allowed-action matrix. v == nil means no

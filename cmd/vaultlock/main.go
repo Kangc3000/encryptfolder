@@ -18,12 +18,32 @@ func main() {
 			os.Exit(1)
 		}
 	}()
+	if !acquireSingleInstance() {
+		_ = zenity.Info("VaultLock is already running. Look for its window.", zenity.Title(appTitle))
+		return
+	}
 	run()
+}
+
+// pick shows a list with the first item pre-selected. An empty choice (OK
+// with nothing selected) is treated like Cancel so the loop never repeats
+// the same dialog without the user having chosen anything.
+func pick(prompt string, items []string) (string, error) {
+	choice, err := zenity.List(prompt, items, zenity.Title(appTitle),
+		zenity.DefaultItems(items[0]), zenity.DisallowEmpty())
+	if err == nil && choice == "" {
+		return "", zenity.ErrCanceled
+	}
+	return choice, err
 }
 
 func run() {
 	for {
-		vaults := discoverVaults(searchDirs())
+		vaults, derr := discoverVaults(searchDirs())
+		if derr != nil {
+			showError(derr)
+			return
+		}
 
 		var cur *vaultInfo
 		switch len(vaults) {
@@ -32,7 +52,7 @@ func run() {
 			cur = &vaults[0]
 		default:
 			names := vaultLabels(vaults)
-			choice, err := zenity.List("Choose a vault:", names, zenity.Title(appTitle))
+			choice, err := pick("Choose a vault:", names)
 			if err != nil {
 				if !errors.Is(err, zenity.ErrCanceled) {
 					showError(err)
@@ -58,7 +78,7 @@ func run() {
 			}
 			prompt = fmt.Sprintf("Vault \"%s\" is %s. What would you like to do?", cur.Name, state)
 		}
-		choice, err := zenity.List(prompt, allowedActions(cur), zenity.Title(appTitle))
+		choice, err := pick(prompt, allowedActions(cur))
 		if err != nil {
 			if errors.Is(err, zenity.ErrCanceled) {
 				if len(vaults) > 1 {
