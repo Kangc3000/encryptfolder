@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/hkdf"
@@ -19,7 +21,7 @@ import (
 const (
 	headerSize    = 4096
 	magic         = "EFVAULT1"
-	formatVersion = 2 // 1 was never released; it bound chunks to the meta nonce and had no session token
+	formatVersion = 3 // 1 was never released; 2 had no label block
 
 	saltSize      = 32
 	nonceSize     = 12
@@ -38,7 +40,16 @@ const (
 	offCapacity = 51
 	offNonce    = 59
 	offMetaCT   = 71
-	offEnd      = offMetaCT + metaCTSize // 128
+	offEnd      = offMetaCT + metaCTSize // 128: end of the meta ciphertext
+
+	// Label block: plaintext, authenticated as part of the meta AAD.
+	ownerSize       = 64
+	offLabel        = offEnd               // 128
+	offOwner        = offLabel             // 128
+	offCreated      = offOwner + ownerSize // 192
+	offLastUnlocked = offCreated + 8       // 200
+	offLastLocked   = offLastUnlocked + 8  // 208
+	offLabelEnd     = offLastLocked + 8    // 216
 
 	minCapacity = 1 << 20
 
@@ -60,6 +71,16 @@ type header struct {
 	capacity int64
 	nonce    [nonceSize]byte
 	metaCT   [metaCTSize]byte
+	label    label
+}
+
+// label is the plaintext label block. It is authenticated only through the
+// meta AAD, so it is trusted for display and nothing else.
+type label struct {
+	owner        [ownerSize]byte // UTF-8, zero-padded
+	created      int64           // unix seconds
+	lastUnlocked int64           // unix seconds, 0 = never
+	lastLocked   int64           // unix seconds, 0 = never
 }
 
 // meta is the decrypted meta block.
@@ -83,11 +104,67 @@ func (h *header) marshal() []byte {
 	binary.BigEndian.PutUint64(b[offCapacity:], uint64(h.capacity))
 	copy(b[offNonce:], h.nonce[:])
 	copy(b[offMetaCT:], h.metaCT[:])
+	copy(b[offOwner:], h.label.owner[:])
+	binary.BigEndian.PutUint64(b[offCreated:], uint64(h.label.created))
+	binary.BigEndian.PutUint64(b[offLastUnlocked:], uint64(h.label.lastUnlocked))
+	binary.BigEndian.PutUint64(b[offLastLocked:], uint64(h.label.lastLocked))
 	return b
 }
 
-// metaAAD returns header bytes 0..59, the additional data of the meta block.
-func (h *header) metaAAD() []byte { return h.marshal()[:offNonce] }
+// metaAAD returns header bytes 0..59 followed by the label block (bytes
+// 128..216), the additional data of the meta block.
+func (h *header) metaAAD() []byte {
+	b := h.marshal()
+	aad := make([]byte, 0, offNonce+offLabelEnd-offLabel)
+	aad = append(aad, b[:offNonce]...)
+	return append(aad, b[offLabel:offLabelEnd]...)
+}
+
+// validOwner reports whether owner fits the label block: at most ownerSize
+// bytes of valid UTF-8 with no bytes below 0x20.
+func validOwner(owner []byte) bool {
+	if len(owner) > ownerSize || !utf8.Valid(owner) {
+		return false
+	}
+	for _, c := range owner {
+		if c < 0x20 {
+			return false
+		}
+	}
+	return true
+}
+
+// parseLabel decodes and validates the label block b[offLabel:offLabelEnd].
+func parseLabel(b []byte) (label, error) {
+	var l label
+	raw := b[offOwner : offOwner+ownerSize]
+	n := bytes.IndexByte(raw, 0)
+	if n < 0 {
+		n = ownerSize
+	}
+	if !validOwner(raw[:n]) || !allZero(raw[n:]) {
+		return label{}, fmt.Errorf("%w: %w: invalid owner name", ErrCorrupt, ErrBadLabel)
+	}
+	copy(l.owner[:], raw)
+	ts := [3]*int64{&l.created, &l.lastUnlocked, &l.lastLocked}
+	for i, off := range [3]int{offCreated, offLastUnlocked, offLastLocked} {
+		v := binary.BigEndian.Uint64(b[off:])
+		if v > math.MaxInt64 {
+			return label{}, fmt.Errorf("%w: %w: invalid date", ErrCorrupt, ErrBadLabel)
+		}
+		*ts[i] = int64(v)
+	}
+	return l, nil
+}
+
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
 
 func parseHeader(b []byte) (*header, error) {
 	if len(b) < headerSize || string(b[:len(magic)]) != magic {
@@ -111,6 +188,11 @@ func parseHeader(b []byte) (*header, error) {
 	copy(h.salt[:], b[offSalt:])
 	copy(h.nonce[:], b[offNonce:])
 	copy(h.metaCT[:], b[offMetaCT:])
+	l, err := parseLabel(b)
+	if err != nil {
+		return nil, err
+	}
+	h.label = l
 	return h, nil
 }
 
@@ -151,9 +233,11 @@ func readHeader(f *os.File) (*header, error) {
 	return h, nil
 }
 
-// writeMeta writes the meta nonce and ciphertext (header bytes 59..128).
+// writeMeta writes the meta nonce, the meta ciphertext and the label block
+// (header bytes 59..216) in one write, so the label and the meta sealed over
+// it reach the disk together.
 func writeMeta(f io.WriterAt, h *header) error {
-	_, err := f.WriteAt(h.marshal()[offNonce:offEnd], offNonce)
+	_, err := f.WriteAt(h.marshal()[offNonce:offLabelEnd], offNonce)
 	return err
 }
 
@@ -226,6 +310,7 @@ func (h *header) openMeta(kMeta []byte) (meta, error) {
 }
 
 // sealMeta encrypts m under kMeta with the given nonce and stores both in h.
+// The AAD covers h's current label, so set the label before sealing.
 // The caller must pass a nonce that has never been used with kMeta (in
 // practice: 12 fresh bytes from crypto/rand).
 func (h *header) sealMeta(kMeta []byte, nonce [nonceSize]byte, m meta) error {

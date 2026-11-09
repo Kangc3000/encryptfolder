@@ -25,7 +25,7 @@ func newTestVault(t *testing.T) (*Vault, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "Test.vault")
-	if err := Create(path, testCap, pw(), testParams, nil); err != nil {
+	if err := Create(path, testCap, "Test Owner", pw(), testParams, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	v, err := Open(path)
@@ -226,6 +226,24 @@ func TestHeaderLayout(t *testing.T) {
 	if offEnd != 128 || metaPlainSize != 41 || metaCTSize != 57 || offEnd > headerSize {
 		t.Fatalf("layout constants wrong: offEnd=%d", offEnd)
 	}
+	if offLabel != 128 || offOwner != 128 || ownerSize != 64 || offCreated != 192 ||
+		offLastUnlocked != 200 || offLastLocked != 208 || offLabelEnd != 216 || offLabelEnd > headerSize {
+		t.Fatalf("label layout constants wrong: offLabelEnd=%d", offLabelEnd)
+	}
+	if formatVersion != 3 {
+		t.Fatalf("formatVersion = %d, want 3", formatVersion)
+	}
+	h := &header{}
+	copy(h.label.owner[:], "Ann")
+	h.label.created = 0x0102030405060708
+	b := h.marshal()
+	if string(b[offOwner:offOwner+3]) != "Ann" || b[offOwner+3] != 0 || b[offCreated] != 1 || b[offCreated+7] != 8 {
+		t.Fatalf("label bytes %x", b[offLabel:offLabelEnd])
+	}
+	aad := h.metaAAD()
+	if len(aad) != offNonce+offLabelEnd-offLabel || !bytes.Equal(aad[:offNonce], b[:offNonce]) || !bytes.Equal(aad[offNonce:], b[offLabel:offLabelEnd]) {
+		t.Fatal("metaAAD is not header[0:59] || header[128:216]")
+	}
 	n := chunkNonce(0x0102030405060708, true)
 	want := [12]byte{0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 1}
 	if n != want {
@@ -238,7 +256,7 @@ func TestCreate(t *testing.T) {
 	path := filepath.Join(dir, "x.vault")
 	var last [2]int64
 	calls := 0
-	if err := Create(path, testCap, pw(), testParams, func(d, tot int64) {
+	if err := Create(path, testCap, "Test Owner", pw(), testParams, func(d, tot int64) {
 		if d < last[0] {
 			t.Errorf("progress went backwards")
 		}
@@ -275,7 +293,7 @@ func TestCreate(t *testing.T) {
 
 	// Never overwrite an existing path.
 	before := fileHash(t, path)
-	if err := Create(path, testCap, pw(), testParams, nil); err == nil {
+	if err := Create(path, testCap, "Test Owner", pw(), testParams, nil); err == nil {
 		t.Fatal("Create over existing file succeeded")
 	}
 	if fileHash(t, path) != before {
@@ -283,13 +301,13 @@ func TestCreate(t *testing.T) {
 	}
 	// Minimum capacity.
 	small := filepath.Join(dir, "small.vault")
-	if err := Create(small, minCapacity-1, pw(), testParams, nil); err == nil {
+	if err := Create(small, minCapacity-1, "Test Owner", pw(), testParams, nil); err == nil {
 		t.Fatal("Create below 1 MiB succeeded")
 	}
 	if exists(small) {
 		t.Fatal("file left behind")
 	}
-	if err := Create(filepath.Join(dir, "min.vault"), minCapacity, pw(), testParams, nil); err != nil {
+	if err := Create(filepath.Join(dir, "min.vault"), minCapacity, "", pw(), testParams, nil); err != nil {
 		t.Fatalf("Create at exactly 1 MiB: %v", err)
 	}
 }
@@ -747,7 +765,7 @@ func TestLockRejectsVaultInsideFolder(t *testing.T) {
 	src := filepath.Join(dir, "Test")
 	os.Mkdir(src, 0o755)
 	path := filepath.Join(src, "inner.vault")
-	if err := Create(path, testCap, pw(), testParams, nil); err != nil {
+	if err := Create(path, testCap, "Test Owner", pw(), testParams, nil); err != nil {
 		t.Fatal(err)
 	}
 	v, err := Open(path)

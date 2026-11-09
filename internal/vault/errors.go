@@ -12,6 +12,10 @@ var (
 	ErrCorrupt       = errors.New("the vault is damaged")
 	ErrFolderExists  = errors.New("the folder already exists")
 	ErrBadFormat     = errors.New("not a VaultLock file")
+	// ErrBadLabel is returned by Create for an owner name longer than 64
+	// bytes, not valid UTF-8 or containing control characters. Open reports
+	// a malformed label block as ErrCorrupt wrapping ErrBadLabel.
+	ErrBadLabel = errors.New("the owner name must be at most 64 bytes of text without control characters")
 
 	// ErrUnsupportedEntry is matched by *UnsupportedEntryError.
 	ErrUnsupportedEntry = errors.New("the folder contains a file that cannot be stored (named pipe, socket or device)")

@@ -13,12 +13,12 @@ import (
 
 const vaultExt = ".vault"
 
-// Action names shown in the action list.
+// Action names; they are also the captions of the action buttons.
 const (
-	actInitialize = "Initialize (create a new vault)"
-	actLock       = "Lock (encrypt the folder)"
-	actUnlock     = "Unlock (decrypt into the folder)"
-	actReset      = "Reset (destroy the vault and start over)"
+	actInitialize = "Initialize"
+	actLock       = "Lock"
+	actUnlock     = "Unlock"
+	actReset      = "Reset"
 )
 
 // vaultInfo describes one vault file found next to the program.
@@ -130,7 +130,7 @@ func allowedActions(v *vaultInfo) []string {
 	}
 }
 
-// vaultLabels returns one list label per vault. Names that occur more than
+// vaultLabels returns one selector label per vault. Names that occur more than
 // once are disambiguated with their directory; labels are always unique.
 func vaultLabels(vs []vaultInfo) []string {
 	count := map[string]int{}

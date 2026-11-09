@@ -9,7 +9,7 @@
 //
 //	offset size field
 //	     0    8 magic "EFVAULT1"
-//	     8    2 format version = 2 (big-endian)
+//	     8    2 format version = 3 (big-endian)
 //	    10    4 Argon2id time
 //	    14    4 Argon2id memory (KiB)
 //	    18    1 Argon2id threads
@@ -17,14 +17,24 @@
 //	    51    8 capacity in bytes (whole file size)
 //	    59   12 meta nonce
 //	    71   57 meta ciphertext (41 bytes plaintext + 16-byte GCM tag)
-//	   128    … zero padding to 4096
+//	   128   64 owner (UTF-8, zero-padded; label block)
+//	   192    8 created (unix seconds, big-endian)
+//	   200    8 last unlocked (unix seconds; 0 = never)
+//	   208    8 last locked (unix seconds; 0 = never)
+//	   216    … zero padding to 4096
 //
 // The meta plaintext is state (1 byte: 0 empty, 1 locked), usedLen
 // (8 bytes, big-endian: ciphertext bytes in the data region), lockSalt
 // (16 bytes) and sessionToken (16 bytes; also written, hex-encoded, to
 // .vaultlock-session in the folder Unlock creates). It is sealed with K_meta under a fresh random nonce on every
-// rewrite, with header bytes 0..59 as additional data. Failure to open it is
-// reported as ErrWrongPassword.
+// rewrite, with header bytes 0..59 followed by the label block (bytes
+// 128..216) as additional data. Failure to open it is reported as
+// ErrWrongPassword.
+//
+// The label block is plaintext so Label can show the owner and dates without
+// the password; it is authenticated only when a password is used, so it is
+// for display only. Create sets created, Unlock sets last unlocked and Lock
+// sets last locked, each in the same write as the meta block sealed over it.
 //
 // # Keys
 //

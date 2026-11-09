@@ -37,7 +37,7 @@ func TestEndToEndOnDisk(t *testing.T) {
 	pw := func() []byte { return []byte("correct horse battery staple") }
 
 	start := time.Now()
-	if err := Create(vaultPath, capacity, pw(), DefaultParams, nil); err != nil {
+	if err := Create(vaultPath, capacity, "Test Owner", pw(), DefaultParams, nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	t.Logf("Create %d MiB: %s", capacity>>20, time.Since(start).Round(time.Millisecond))

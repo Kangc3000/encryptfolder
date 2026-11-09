@@ -60,7 +60,7 @@ All primitives from Go's standard library and `golang.org/x/crypto`.
 | offset | size | field |
 |---|---|---|
 | 0 | 8 | magic `"EFVAULT1"` |
-| 8 | 2 | format version = 2 (big-endian) |
+| 8 | 2 | format version = 3 (big-endian) |
 | 10 | 4 | argon2 time |
 | 14 | 4 | argon2 memory (KiB) |
 | 18 | 1 | argon2 threads |
@@ -68,11 +68,26 @@ All primitives from Go's standard library and `golang.org/x/crypto`.
 | 51 | 8 | capacity in bytes (whole file size) |
 | 59 | 12 | meta nonce |
 | 71 | 57 | meta ciphertext (41 bytes plaintext + 16 tag) |
-| 128 | … | zero padding to 4096 |
+| 128 | 64 | owner: UTF-8, zero-padded (label block) |
+| 192 | 8 | created: unix seconds, big-endian |
+| 200 | 8 | lastUnlocked: unix seconds, 0 = never |
+| 208 | 8 | lastLocked: unix seconds, 0 = never |
+| 216 | … | zero padding to 4096 |
 
 Meta plaintext (41 bytes): `state` (1: 0=empty, 1=locked), `usedLen`
 (8, big-endian, bytes of ciphertext in the data region), `lockSalt` (16),
-`sessionToken` (16). AAD for the meta block = header bytes 0..59.
+`sessionToken` (16). AAD for the meta block = header bytes 0..59 ‖ label
+block bytes 128..216, so any edit to the owner or the dates makes the meta
+block fail (`ErrWrongPassword`).
+
+The label block is plaintext so the UI can show owner and dates without the
+password (`Label()`). Create rejects an owner longer than 64 bytes, not
+valid UTF-8 or containing bytes < 0x20 (`ErrBadLabel`); an empty owner is
+allowed. Open rejects a malformed label block (`ErrCorrupt` wrapping
+`ErrBadLabel`); otherwise the label is trusted for display only. Create
+sets `created`; Unlock sets `lastUnlocked` and Lock sets `lastLocked` when
+they rewrite meta, in the same write (bytes 59..216), so timestamp and meta
+are sealed together. Destroy scrubs the label with the rest of the header.
 
 `sessionToken` is drawn fresh by every Unlock and every Lock. Unlock writes
 it, hex-encoded (32 characters), to `.vaultlock-session` (mode 0600) in
@@ -152,8 +167,8 @@ encryptfolder/
   internal/vault/               crypto core, no UI
     vault.go  errors.go  header.go  stream.go  tar.go  record.go
     remove.go  verify_darwin.go  verify_other.go  *_test.go
-  cmd/vaultlock/                dialog UI (github.com/ncruces/zenity)
-    main.go  actions.go  discover.go
+  cmd/vaultlock/                window UI (gioui.org)
+    main.go  ui.go  actions.go  discover.go  diskfree_*.go  single_*.go
   build/
     build.sh                    produces dist/Tools/VaultLock.exe and dist/Tools/VaultLock.app
     Info.plist                  for the .app bundle
@@ -179,6 +194,7 @@ var (
     ErrCorrupt       = errors.New("the vault is damaged")
     ErrFolderExists  = errors.New("the folder already exists")
     ErrBadFormat     = errors.New("not a VaultLock file")
+    ErrBadLabel      // Create: owner > 64 bytes, invalid UTF-8 or control bytes
 
     ErrUnsupportedEntry // *UnsupportedEntryError{Path}: pipe, socket or device; nothing written
     ErrVaultEmptied     // *EmptiedError{Cause}: failure after writing began; vault reset to empty
@@ -186,14 +202,22 @@ var (
     ErrFolderChanged    // Lock: vault valid, folder changed and was kept
 )
 
+type Label struct {
+    Owner        string
+    Created      time.Time
+    LastUnlocked time.Time // zero Time if never
+    LastLocked   time.Time // zero Time if never
+}
+
 // Create writes a new vault of exactly capacity bytes (>= 1 MiB).
-func Create(path string, capacity int64, password []byte, p Params, prog Progress) error
+func Create(path string, capacity int64, owner string, password []byte, p Params, prog Progress) error
 
 // Open reads and validates the header. No password needed.
 func Open(path string) (*Vault, error)
 
 func (v *Vault) Path() string
 func (v *Vault) Capacity() int64
+func (v *Vault) Label() Label   // from the header, no password needed
 
 // Status decrypts the meta block.
 func (v *Vault) Status(password []byte) (State, int64, error)
@@ -213,13 +237,24 @@ func Destroy(path string) error
 
 ## UI (cmd/vaultlock)
 
-* Native dialogs via `github.com/ncruces/zenity` (pure Go; Win32 dialogs
-  on Windows, osascript dialogs on macOS). Flow: action list → inputs →
-  password → progress → result message.
-* Password dialogs use hidden input. Initialize asks twice and rejects a
-  mismatch or fewer than 8 characters.
-* Progress dialog during Create, Lock (write and verify passes), Unlock.
-* Every error is shown in a dialog with the error text; never a panic.
+* One resizable window (Gio, `gioui.org`; pure Go on Windows, cgo on
+  macOS). Top: a status card showing vault name, owner, state badge
+  (Locked / Unlocked / Empty), capacity, created, last unlocked, last
+  locked, and the folder path and size while unlocked; a chip selector
+  when several vaults exist. Bottom: four large icon buttons —
+  Initialize, Unlock, Lock, Reset — enabled per the allowed-action matrix.
+* Forms replace the card in the same window; no OS dialogs. Initialize
+  asks vault name, owner name (≤ 64 bytes), size (chips or custom GB,
+  must leave 64 MiB free) and password twice (min 8, must match).
+  Enter submits Initialize/Unlock/Lock; destructive confirmations require
+  a click. Esc cancels any form.
+* Long operations run off the UI thread with an in-window progress bar
+  ("Creating…", "Encrypting…" → "Verifying…" past the midpoint,
+  "Decrypting…"); results and errors show as coloured banners.
+* The "Empty" badge is inferred (no folder and never locked), because the
+  real state lives in the encrypted meta block.
+* A single-instance guard (flock on Unix, exclusive file handle on
+  Windows) makes a second launch show "already running" instead.
 * Windows build flag `-ldflags "-s -w -H windowsgui"`; macOS binary is
   wrapped in `VaultLock.app` so double-click does not open Terminal.
 
@@ -228,8 +263,8 @@ func Destroy(path string) error
 ```
 build/build.sh
   GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -H windowsgui" -o dist/Tools/VaultLock.exe ./cmd/vaultlock
-  GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o build/VaultLock-arm64 ./cmd/vaultlock
-  GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o build/VaultLock-amd64 ./cmd/vaultlock
+  GOOS=darwin  GOARCH=arm64 CGO_ENABLED=1 go build -trimpath -ldflags "-s -w" -o build/VaultLock-arm64 ./cmd/vaultlock   # needs clang (Xcode CLT)
+  GOOS=darwin  GOARCH=amd64 CGO_ENABLED=1 go build -trimpath -ldflags "-s -w" -o build/VaultLock-amd64 ./cmd/vaultlock
   lipo -create -output dist/Tools/VaultLock.app/Contents/MacOS/VaultLock build/VaultLock-arm64 build/VaultLock-amd64
   cp build/Info.plist dist/Tools/VaultLock.app/Contents/
 ```
@@ -242,5 +277,7 @@ build/build.sh
 * Opening a file from the unlocked folder with another application may
   leave temporary copies on the host computer.
 * Capacity is fixed at Initialize; Reset is the only way to change it.
+* The owner name and the created / last unlocked / last locked dates are
+  stored in plaintext: anyone holding the drive can read them.
 * Unsigned executables: Windows SmartScreen may warn once; macOS may need
   right-click → Open if the bundle acquires a quarantine flag.

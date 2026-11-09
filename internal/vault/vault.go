@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // Params are the Argon2id parameters stored in a vault header.
@@ -33,6 +35,16 @@ const (
 // Progress reports done out of total units of work. It may be nil.
 type Progress func(done, total int64)
 
+// Label is the plaintext label stored in the header: readable without the
+// password, and authenticated (with the meta block) only when a password is
+// used. Treat it as display-only.
+type Label struct {
+	Owner        string
+	Created      time.Time
+	LastUnlocked time.Time // zero Time if never
+	LastLocked   time.Time // zero Time if never
+}
+
 // Vault is an opened vault file. Its methods re-read the header from disk.
 type Vault struct {
 	path string
@@ -40,10 +52,15 @@ type Vault struct {
 }
 
 // Create writes a new vault of exactly capacity bytes (>= 1 MiB) at path,
-// which must not exist. The data region is filled with random bytes;
+// which must not exist. owner (at most 64 bytes of UTF-8 without control
+// characters, may be empty; else ErrBadLabel) is stored in the plaintext
+// label with the creation time. The data region is filled with random bytes;
 // prog reports bytes of filler written. password is zeroed.
-func Create(path string, capacity int64, password []byte, p Params, prog Progress) (err error) {
+func Create(path string, capacity int64, owner string, password []byte, p Params, prog Progress) (err error) {
 	defer wipe(password)
+	if !validOwner([]byte(owner)) {
+		return ErrBadLabel
+	}
 	if capacity < minCapacity {
 		return fmt.Errorf("vault: capacity %d is below the 1 MiB minimum", capacity)
 	}
@@ -69,6 +86,8 @@ func Create(path string, capacity int64, password []byte, p Params, prog Progres
 	}()
 
 	h := &header{params: p, capacity: capacity}
+	copy(h.label.owner[:], owner)
+	h.label.created = time.Now().Unix()
 	if err := randRead(h.salt[:]); err != nil {
 		return err
 	}
@@ -138,6 +157,30 @@ func (v *Vault) Path() string { return v.path }
 
 // Capacity returns the vault file size in bytes.
 func (v *Vault) Capacity() int64 { return v.hdr.capacity }
+
+// Label returns the plaintext label from the header as last read from disk
+// (by Open or by any method that re-reads the header). No password is
+// needed; the label is not authenticated until a password is used.
+func (v *Vault) Label() Label {
+	l := v.hdr.label
+	owner := l.owner[:]
+	if i := bytes.IndexByte(owner, 0); i >= 0 {
+		owner = owner[:i]
+	}
+	return Label{
+		Owner:        string(owner),
+		Created:      unixOrZero(l.created),
+		LastUnlocked: unixOrZero(l.lastUnlocked),
+		LastLocked:   unixOrZero(l.lastLocked),
+	}
+}
+
+func unixOrZero(s int64) time.Time {
+	if s == 0 {
+		return time.Time{}
+	}
+	return time.Unix(s, 0)
+}
 
 // Status decrypts the meta block and returns the state and the stream
 // length in bytes. password is zeroed.
@@ -353,6 +396,7 @@ func (v *Vault) lockStream(password []byte, job lockJob, prog Progress) (err err
 		return emptied(err)
 	}
 	nh := *h
+	nh.label.lastLocked = time.Now().Unix()
 	if err := nh.sealMeta(ks.meta, nonce, m); err != nil {
 		return emptied(err)
 	}
@@ -530,6 +574,7 @@ func (v *Vault) Unlock(password []byte, destDir string, prog Progress) (err erro
 		return err
 	}
 	nh := *h
+	nh.label.lastUnlocked = time.Now().Unix()
 	if err := nh.sealMeta(ks.meta, nonce, nm); err != nil {
 		return err
 	}
